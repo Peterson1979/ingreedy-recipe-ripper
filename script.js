@@ -1,6 +1,6 @@
 document.addEventListener('DOMContentLoaded', () => {
     // Config
-    const BACKEND_URL = 'http://127.0.0.1:5000/api/rip-recipe';
+    const BACKEND_URL = 'https://ingreedy-recipe-ripper.onrender.com/api/rip-recipe';
     const STORAGE_KEY = 'ingreedyShoppingList';
 
     // DOM Elements
