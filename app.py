@@ -6,22 +6,7 @@ from bs4 import BeautifulSoup
 import re
 import traceback
 import json
-from urllib.parse import urlparse, parse_qs, unquote # Added unquote
-
-# --- Environment Variable Loading ---
-from dotenv import load_dotenv
-load_dotenv() # Load variables from .env file into environment
-
-# --- Pinterest API Credentials ---
-PINTEREST_APP_ID = os.getenv('PINTEREST_APP_ID')
-PINTEREST_APP_SECRET = os.getenv('PINTEREST_APP_SECRET')
-PINTEREST_ACCESS_TOKEN = os.getenv('PINTEREST_ACCESS_TOKEN') # Using manually generated token for now
-
-# Check if essential Pinterest creds are missing (only if using the API path)
-PINTEREST_API_ENABLED = bool(PINTEREST_ACCESS_TOKEN) # Enable API path only if token exists
-if not PINTEREST_API_ENABLED:
-     print("WARNING: PINTEREST_ACCESS_TOKEN not found in environment/.env. Pinterest API calls disabled.")
-
+from urllib.parse import urlparse, parse_qs
 
 # Import recipe-scrapers library & specific error types
 from recipe_scrapers import scrape_me, WebsiteNotImplementedError, NoSchemaFoundInWildMode
@@ -38,61 +23,219 @@ app.config.from_object(__name__)
 # Enable CORS
 CORS(app, resources={r'/api/*': {'origins': '*'}}) # Adjust origins for production
 
-
-# --- NEW: Pinterest API Helper Function ---
-def get_pin_data_from_api(pin_id):
-    """Fetches Pin data using Pinterest API v5."""
-    if not PINTEREST_API_ENABLED:
-        print("Pinterest API is disabled (missing access token).")
-        return None # Cannot proceed without token
-
-    api_url = f"https://api.pinterest.com/v5/pins/{pin_id}"
-    headers = {
-        "Authorization": f"Bearer {PINTEREST_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    print(f"--- Calling Pinterest API: GET {api_url} ---")
+# --- Helper Function: Extract Source URL from Pinterest ---
+def extract_source_url_from_pinterest(pinterest_url, headers):
+    """
+    Attempts to find the external source URL linked from a Pinterest pin page.
+    Uses multiple strategies. Returns None if no external URL is reliably found.
+    """
+    print(f"--- Attempting to extract source URL from Pinterest: {pinterest_url} ---")
     try:
-        response = requests.get(api_url, headers=headers, timeout=10)
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        pin_data = response.json()
-        print("--- Pinterest API Response Received ---")
-        # print(json.dumps(pin_data, indent=2)) # Optional: Log full response for debugging
-        return pin_data
-    except HTTPError as http_err:
-         # Handle specific API errors (e.g., 401 Unauthorized, 404 Not Found)
-         print(f"HTTP error occurred calling Pinterest API: {http_err} - Response: {http_err.response.text}")
-         if http_err.response.status_code == 401:
-              raise ValueError("Pinterest API authentication failed. Check your Access Token.")
-         elif http_err.response.status_code == 404:
-              raise ValueError(f"Pin with ID {pin_id} not found via Pinterest API.")
-         else:
-              raise ValueError(f"Pinterest API returned an error (Status {http_err.response.status_code}).")
-    except RequestException as req_err:
-        print(f"Network error occurred calling Pinterest API: {req_err}")
-        raise ValueError("Could not connect to the Pinterest API.")
-    except json.JSONDecodeError as json_err:
-         print(f"Error decoding Pinterest API response: {json_err}")
-         raise ValueError("Received an invalid response from the Pinterest API.")
+        response = requests.get(pinterest_url, headers=headers, timeout=12)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # Strategy 1: JSON-LD
+        script_tag = soup.find('script', {'type': 'application/ld+json'})
+        if script_tag and script_tag.string:
+            try:
+                json_data = json.loads(script_tag.string); data_to_check = []
+                if isinstance(json_data, dict): data_to_check.append(json_data)
+                if isinstance(json_data, list): data_to_check.extend(json_data)
+                if isinstance(json_data, dict) and '@graph' in json_data and isinstance(json_data['@graph'], list): data_to_check.extend(json_data['@graph'])
+                for item in data_to_check:
+                    if not isinstance(item, dict): continue
+                    item_type = item.get('@type', ''); source_url = None
+                    if 'Recipe' in item_type: source_url = item.get('mainEntityOfPage', {}).get('@id') or item.get('url')
+                    elif 'CreativeWork' in item_type or 'Article' in item_type: source_url = item.get('mainEntityOfPage', {}).get('@id') or item.get('url') or item.get('url')
+                    if source_url and isinstance(source_url, str) and source_url.startswith('http') and 'pinterest.com' not in source_url:
+                        print(f"Found source URL via JSON-LD ({item_type}): {source_url}"); return source_url
+            except Exception as e: print(f"Error processing JSON-LD: {e}")
+
+        # Strategy 2: Meta Tags
+        meta_tag = soup.find('meta', property='og:see_also')
+        if meta_tag and meta_tag.get('content','').startswith('http') and 'pinterest.com' not in meta_tag['content']:
+             source_url = meta_tag['content']; print(f"Found source URL via meta og:see_also: {source_url}"); return source_url
+
+        # Strategy 3: Specific Link Attributes
+        link_selectors = ['a[data-test-id="pin-closeup-link"]','div[data-test-id="CloseupDetails"] a[href^="http"]','a[data-test-id="forward-button"]','a[class*="linkModule"]','a[class*="externalLink"]','div[data-test-id="pin-visual-wrapper"] a[href^="http"]']
+        for selector in link_selectors:
+            potential_link = soup.select_one(selector)
+            if potential_link and potential_link.get('href','').startswith('http'):
+                 href = potential_link['href']
+                 if 'pinterest.com/redirect/' in href:
+                     try:
+                         parsed_href = urlparse(href)
+                         final_url = parse_qs(parsed_href.query).get('url', [None])[0]
+                         if final_url: print(f"Resolved redirect from selector '{selector}': {final_url}"); return final_url
+                     except Exception: pass
+                 elif 'pinterest.com' not in href:
+                     print(f"Found potential source URL via selector '{selector}': {href}")
+                     return href
+
+        print("--- Could not find a reliable source URL on the Pinterest page via known methods. ---")
+        return None
+    except RequestException as e: print(f"Failed to fetch Pinterest URL {pinterest_url}: {e}"); raise ValueError(f"Could not fetch the Pinterest page (URL: {pinterest_url}). Error: {e}")
+    except Exception as e: print(f"Error parsing Pinterest page {pinterest_url}: {e}"); traceback.print_exc(); raise ValueError(f"An error occurred while trying to analyze the Pinterest page.")
+
+
+# --- Scraping Logic Function: Using recipe-scrapers library ---
+def scrape_ingredients_with_library(url, headers):
+    """Attempts scraping using the recipe-scrapers library, trying specific host first."""
+    scraper = None
+    try:
+        print(f"--- Attempting scraping with recipe-scrapers library for: {url} ---")
+        try: scraper = scrape_me(url, wild_mode=False); print(f"Found specific scraper: {type(scraper).__name__}")
+        except WebsiteNotImplementedError:
+             print("No specific scraper found, trying wild_mode...")
+             try: scraper = scrape_me(url, wild_mode=True); print(f"Wild mode found scraper: {type(scraper).__name__}")
+             except (WebsiteNotImplementedError, NoSchemaFoundInWildMode): print(f"--- recipe-scrapers wild_mode also failed or found no schema for: {url} ---"); return None
+             except Exception as wild_err: print(f"--- Unexpected error during recipe-scrapers wild_mode: {wild_err} ---"); traceback.print_exc(); return None
+        if scraper:
+            ingredients_list = scraper.ingredients()
+            if ingredients_list:
+                print(f"--- recipe-scrapers successful: Found {len(ingredients_list)} ingredients ---")
+                cleaned_list = []; junk_keywords_library = ["advertisement","nutrition","subscribe","related","you may also like","jump to","print recipe","rate this","leave a comment","serving size","calories","video","instructions","notes","equipment","expert tips", "recipe developer", "photographer"]
+                for item in ingredients_list:
+                    item_lower = item.lower(); item_strip = item.strip()
+                    if item_strip and not any(keyword in item_lower for keyword in junk_keywords_library):
+                         if len(item_strip.split()) > 1 or any(char.isdigit() for char in item_strip): cleaned_list.append(item_strip)
+                return "\n".join(cleaned_list) if cleaned_list else None
+            else: print("--- recipe-scrapers found scraper but no ingredients method result. ---"); return None
+        else: print("--- recipe-scrapers library could not initialize scraper object. ---"); return None
+    except (RequestException, ConnectionError, HTTPError, Timeout) as req_err: print(f"--- Network error during recipe-scrapers processing: {req_err} ---"); return None
+    except Exception as e: print(f"--- Unexpected error during recipe-scrapers processing: {e}"); traceback.print_exc(); return None
+
+
+# --- Scraping Logic Function: Using BeautifulSoup (Fallback) ---
+def scrape_ingredients_with_bs(url, headers):
+    """Fallback scraping using BeautifulSoup (custom logic for NON-PINTEREST URLs)."""
+    print(f"--- Falling back to BeautifulSoup scraping for: {url} ---")
+    if 'pinterest.com' in url.lower() and '/pin/' in url.lower():
+         print("BS Scraper - Error: BS fallback should not be called directly for Pinterest URLs.")
+         return None
+
+    ingredients = []; processed_elements = set()
+    try:
+        response = requests.get(url, headers=headers, timeout=15); print(f"BS Scraper - Received status code: {response.status_code}"); response.raise_for_status()
+        try: import lxml; parser = 'lxml'
+        except ImportError: parser = 'html.parser'
+        print(f"BS Scraper - Using HTML parser: {parser}"); soup = BeautifulSoup(response.content, parser)
+
+        # --- BS Strategy 1: Specific item classes ---
+        common_item_classes=['wprm-recipe-ingredient','tasty-recipes-ingredient','mv-recipe-ingredient','ingredients-item-name','recipe-ingredient','ingredient']
+        print("BS Scraper - Running Strategy 1: Specific Item Classes")
+        for class_name in common_item_classes:
+            elements=soup.find_all(class_=re.compile(r'\b' + re.escape(class_name) + r'\b', re.I))
+            if elements:
+                for el in elements:
+                    el_id=str(el)
+                    if el_id not in processed_elements:
+                        text_parts=[part.strip() for part in el.stripped_strings]; text=' '.join(filter(None, text_parts));
+                        if text: ingredients.append(text); processed_elements.add(el_id)
+
+        # --- BS Strategy 2: Lists near headings ---
+        print("BS Scraper - Running Strategy 2: Lists (ul/ol)")
+        list_containers = []; potential_list_classes=['ingredients','ingredient-list','recipe-ingredients']
+        for list_class in potential_list_classes:
+             found_lists=soup.find_all(['ul', 'ol'], class_=re.compile(r'\b' + re.escape(list_class) + r'\b', re.I));
+             if found_lists: list_containers.extend(found_lists)
+        headings=soup.find_all(['h2','h3','h4','h5','strong','p'], string=re.compile(r'(ingredients|for the\b|\btips\b|\bnotes\b)', re.I))
+        for heading in headings:
+            heading_text=heading.get_text(strip=True); is_relevant_heading=2 < len(heading_text) < 60; is_likely_paragraph=len(heading_text.split()) > 10 and '.' in heading_text
+            if is_relevant_heading and not is_likely_paragraph:
+                 is_already_added=False
+                 if ingredients:
+                     clean_heading = heading_text.lower().rstrip(':').strip()
+                     clean_last_item = ingredients[-1].lower().rstrip(':').strip()
+                     if clean_heading == clean_last_item: is_already_added = True
+                 if not is_already_added:
+                     heading_id=str(heading)
+                     if heading_id not in processed_elements:
+                         ingredients.append(heading_text)
+                         processed_elements.add(heading_id)
+            list_element=heading.find_next_sibling(['ul','ol']);
+            if list_element and len(list_element.find_all('li')) < 50:
+                 if list_element not in list_containers: list_containers.append(list_element)
+            list_element_inside=heading.find_next(['ul','ol']);
+            if list_element_inside and len(list_element_inside.find_all('li')) < 50:
+                 if list_element_inside not in list_containers: list_containers.append(list_element_inside)
+        processed_lists=set(); unique_list_containers=[]
+        for lst in list_containers:
+            list_id=str(lst)
+            if list_id not in processed_lists:
+                unique_list_containers.append(lst)
+                processed_lists.add(list_id)
+
+        if unique_list_containers:
+             print(f"BS Scraper - Processing {len(unique_list_containers)} unique lists.")
+             for lst in unique_list_containers:
+                 possible_items=lst.find_all('li')
+                 for item in possible_items:
+                     item_id=str(item)
+                     if item_id not in processed_elements:
+                        text_parts=[part.strip() for part in item.stripped_strings]; text=' '.join(filter(None, text_parts)); has_number=any(char.isdigit() for char in text); is_reasonable_length=0<len(text.split())<25; is_not_just_link=not item.find('a') or len(item.find_all('a'))<len(text.split())/2; looks_like_junk=any(jp in text.lower() for jp in["related posts","you may also like","leave a reply","share this recipe","email recipe"])or text.lower().strip()=='ingredients'
+                        if text and is_reasonable_length and is_not_just_link and not looks_like_junk: ingredients.append(text); processed_elements.add(item_id)
+                        elif text and has_number and len(text.split())<25 and not looks_like_junk: ingredients.append(text); processed_elements.add(item_id)
+
+        # --- BS Cleaning Stage ---
+        if not ingredients: print("BS Scraper - No potential ingredients found."); return None
+        print(f"BS Scraper - Found {len(ingredients)} raw lines before cleaning.")
+        junk_phrases_exact=["scale","usm","units","ingredients"]; junk_phrases_contain=["cook mode","prevent your screen","nutrition information","optional","equipment","instructions","recipe notes","serving size","calories","related posts","jump to recipe","print recipe","pin recipe","advertisement","share this","you may also like","leave a reply","reader interactions","expert tips","variations","storage","make ahead","about","contact","partner with us","privacy policy","terms of service","careers","media kit","advertising","subscribe","newsletter","all rights reserved","back to top","more recipes","shop","similar recipes","faq","frequently asked questions","sponsored","disclosure","affiliate links","this post may contain","skip to content","skip to main content","search","log in","register","about at media","image","photo","video","recipe originally published","sign up","follow us","get the book","free trial"]; junk_patterns_regex=[r'^\d+/\d+x\d+x\d+x$',r'^\d+x$',r'click here',r'print recipe',r'pin recipe',r'jump to recipe',r'advertisement',r'^\s*▢\s*',r'^\d+\s+comments?$',r'^\d+\s+minutes?$',r'(?i)Course:',r'(?i)Cuisine:',r'(?i)Keyword:',r'(?i)Prep time:',r'(?i)Cook time:',r'(?i)Total time:',r'(?i)Servings:',r'^\©?\s*\d{4}',r'(?i)facebook',r'(?i)instagram',r'(?i)twitter',r'(?i)pinterest',r'(?i)youtube',r'(?i)tiktok',r'(?i)read more',r'^\s*posted on',r'^\s*updated on',r'^\s*by\s+[A-Za-z\s.-]+',r'^\s*(previous|next)\s+(post|recipe)',r'\.{3,}','★|☆',r'^(watch|view)\s+video',r'(?i)link in bio',r'(?i)featured in']
+        cleaned_ingredients=[];
+        for item in ingredients:
+            original_item_stripped=item.strip(); temp_item_lower=original_item_stripped.lower(); is_junk=False; word_count=len(original_item_stripped.split())
+            if word_count > 35: is_junk=True
+            # *** CORRECTED Syntax HERE ***
+            if not is_junk and word_count == 1 and not any(char.isdigit() for char in original_item_stripped):
+                allowed_single_words = {'salt', 'pepper', 'oil', 'sugar', 'flour', 'water', 'milk', 'eggs', 'butter', 'onion', 'garlic'}
+                if temp_item_lower not in allowed_single_words:
+                    is_junk = True
+            # *** END Correction ***
+            if not is_junk and temp_item_lower in junk_phrases_exact: is_junk=True
+            if not is_junk:
+                for junk in junk_phrases_contain:
+                    if junk in temp_item_lower:
+                         if word_count>4 or len(junk.split())<=2 : is_junk=True; break
+            if not is_junk:
+                for pattern in junk_patterns_regex:
+                    if re.search(pattern, original_item_stripped, re.I): is_junk=True; break
+            if not is_junk and original_item_stripped:
+                 if item.isupper() and 1<word_count<6: cleaned_ingredients.append(original_item_stripped.title())
+                 else: cleaned_ingredients.append(original_item_stripped)
+
+        seen=set(); final_ingredients=[]
+        for item in cleaned_ingredients:
+            item_lower=item.lower().strip().rstrip(':').strip()
+            if item_lower and item_lower not in seen:
+                final_ingredients.append(item)
+                seen.add(item_lower)
+
+        if not final_ingredients: print("BS Scraper - Cleaning removed all items."); return None
+        print(f"BS Scraper - Returning {len(final_ingredients)} cleaned ingredients.")
+        return "\n".join(final_ingredients)
+
+    # --- BS Error Handling (Corrected Structure) ---
+    except RequestException as e:
+        print(f"BS Scraper - Request failed for URL {url}: {e}")
+        status_code = None
+        if hasattr(e, 'response') and e.response is not None:
+            status_code = e.response.status_code
+
+        if isinstance(e, HTTPError) and status_code == 403: msg = f"Access Forbidden (403). The website blocked the request."
+        elif isinstance(e, HTTPError): msg = f"Website error (Status {status_code}). Page might be missing or restricted."
+        elif isinstance(e, ConnectionError): msg = f"Could not connect to the website at {url}."
+        elif isinstance(e, Timeout): msg = f"The request to {url} timed out."
+        else: msg = f"Could not fetch URL for scraping ({status_code if status_code else 'Network Error'})."
+        raise ValueError(msg)
+
     except Exception as e:
-        print(f"Unexpected error during Pinterest API call: {e}")
+        print(f"BS Scraper - Error during BeautifulSoup processing for URL {url}: {e}")
         traceback.print_exc()
-        raise ValueError("An unexpected error occurred while fetching data from Pinterest API.")
+        raise ValueError(f"An error occurred while parsing the recipe content (fallback method).")
 
 
-# --- Helper: Extract Pin ID from URL ---
-def extract_pin_id(pinterest_url):
-    match = re.search(r'/pin/(\d+)/?', pinterest_url)
-    return match.group(1) if match else None
-
-
-# --- Scraping Logic Functions (scrape_ingredients_with_library, scrape_ingredients_with_bs) ---
-# (These remain unchanged from v3.10.2)
-def scrape_ingredients_with_library(url, headers): /* ... Same as v3.10.2 ... */
-def scrape_ingredients_with_bs(url, headers): /* ... Same as v3.10.2 ... */
-
-
-# --- Main API Endpoint (v3.11 - Uses Pinterest API) ---
+# --- Main API Endpoint (v3.10.2 - Refined Logic) ---
 @app.route('/api/rip-recipe', methods=['POST'])
 def rip_recipe_api():
     if not request.is_json: return jsonify({"error": "Request format must be JSON"}), 415
@@ -102,8 +245,190 @@ def rip_recipe_api():
     if not re.match(r'^https?://', original_url): return jsonify({"error": "Invalid URL provided. Please include http:// or https://"}), 400
 
     target_url = original_url # Default target
-    is_pinterest = 'pinterest.com' in original_url.lower() and '/pin/' in original_url.lower()
-    headers = { # Standard headers for scraping external sites
+    headers = { # Standard headers
+        'User-Agent:
+                         parsed_href = urlparse(href)
+                         final_url = parse_qs(parsed_href.query).get('url', [None])[0]
+                         if final_url: print(f"Resolved redirect from selector '{selector}': {final_url}"); return final_url
+                     except Exception: pass
+                 elif 'pinterest.com' not in href:
+                     print(f"Found potential source URL via selector '{selector}': {href}")
+                     return href
+
+        print("--- Could not find a reliable source URL on the Pinterest page via known methods. ---")
+        return None
+    except RequestException as e: print(f"Failed to fetch Pinterest URL {pinterest_url}: {e}"); raise ValueError(f"Could not fetch the Pinterest page (URL: {pinterest_url}). Error: {e}")
+    except Exception as e: print(f"Error parsing Pinterest page {pinterest_url}: {e}"); traceback.print_exc(); raise ValueError(f"An error occurred while trying to analyze the Pinterest page.")
+
+
+# --- Scraping Logic Function: Using recipe-scrapers library ---
+# (No changes needed in this function from the last version)
+def scrape_ingredients_with_library(url, headers):
+    """Attempts scraping using the recipe-scrapers library, trying specific host first."""
+    scraper = None
+    try:
+        print(f"--- Attempting scraping with recipe-scrapers library for: {url} ---")
+        try: scraper = scrape_me(url, wild_mode=False); print(f"Found specific scraper: {type(scraper).__name__}")
+        except WebsiteNotImplementedError:
+             print("No specific scraper found, trying wild_mode...")
+             try: scraper = scrape_me(url, wild_mode=True); print(f"Wild mode found scraper: {type(scraper).__name__}")
+             except (WebsiteNotImplementedError, NoSchemaFoundInWildMode): print(f"--- recipe-scrapers wild_mode also failed or found no schema for: {url} ---"); return None
+             except Exception as wild_err: print(f"--- Unexpected error during recipe-scrapers wild_mode: {wild_err} ---"); traceback.print_exc(); return None
+        if scraper:
+            ingredients_list = scraper.ingredients()
+            if ingredients_list:
+                print(f"--- recipe-scrapers successful: Found {len(ingredients_list)} ingredients ---")
+                cleaned_list = []; junk_keywords_library = ["advertisement","nutrition","subscribe","related","you may also like","jump to","print recipe","rate this","leave a comment","serving size","calories","video","instructions","notes","equipment","expert tips", "recipe developer", "photographer"]
+                for item in ingredients_list:
+                    item_lower = item.lower(); item_strip = item.strip()
+                    if item_strip and not any(keyword in item_lower for keyword in junk_keywords_library):
+                         if len(item_strip.split()) > 1 or any(char.isdigit() for char in item_strip): cleaned_list.append(item_strip)
+                return "\n".join(cleaned_list) if cleaned_list else None
+            else: print("--- recipe-scrapers found scraper but no ingredients method result. ---"); return None
+        else: print("--- recipe-scrapers library could not initialize scraper object. ---"); return None
+    except (RequestException, ConnectionError, HTTPError, Timeout) as req_err: print(f"--- Network error during recipe-scrapers processing: {req_err} ---"); return None
+    except Exception as e: print(f"--- Unexpected error during recipe-scrapers processing: {e}"); traceback.print_exc(); return None
+
+
+# --- Scraping Logic Function: Using BeautifulSoup (Fallback) ---
+def scrape_ingredients_with_bs(url, headers):
+    """Fallback scraping using BeautifulSoup (custom logic for NON-PINTEREST URLs)."""
+    print(f"--- Falling back to BeautifulSoup scraping for: {url} ---")
+    if 'pinterest.com' in url.lower() and '/pin/' in url.lower():
+         print("BS Scraper - Error: BS fallback should not be called directly for Pinterest URLs.")
+         return None
+
+    ingredients = []; processed_elements = set()
+    try:
+        response = requests.get(url, headers=headers, timeout=15); print(f"BS Scraper - Received status code: {response.status_code}"); response.raise_for_status()
+        try: import lxml; parser = 'lxml'
+        except ImportError: parser = 'html.parser'
+        print(f"BS Scraper - Using HTML parser: {parser}"); soup = BeautifulSoup(response.content, parser)
+
+        # --- BS Strategy 1: Specific item classes ---
+        common_item_classes=['wprm-recipe-ingredient','tasty-recipes-ingredient','mv-recipe-ingredient','ingredients-item-name','recipe-ingredient','ingredient']
+        print("BS Scraper - Running Strategy 1: Specific Item Classes")
+        for class_name in common_item_classes:
+            elements=soup.find_all(class_=re.compile(r'\b' + re.escape(class_name) + r'\b', re.I))
+            if elements:
+                for el in elements:
+                    el_id=str(el)
+                    if el_id not in processed_elements:
+                        text_parts=[part.strip() for part in el.stripped_strings]; text=' '.join(filter(None, text_parts));
+                        if text: ingredients.append(text); processed_elements.add(el_id)
+
+        # --- BS Strategy 2: Lists near headings ---
+        print("BS Scraper - Running Strategy 2: Lists (ul/ol)")
+        list_containers = []; potential_list_classes=['ingredients','ingredient-list','recipe-ingredients']
+        for list_class in potential_list_classes:
+             found_lists=soup.find_all(['ul', 'ol'], class_=re.compile(r'\b' + re.escape(list_class) + r'\b', re.I));
+             if found_lists: list_containers.extend(found_lists)
+        headings=soup.find_all(['h2','h3','h4','h5','strong','p'], string=re.compile(r'(ingredients|for the\b|\btips\b|\bnotes\b)', re.I))
+        for heading in headings:
+            heading_text=heading.get_text(strip=True); is_relevant_heading=2 < len(heading_text) < 60; is_likely_paragraph=len(heading_text.split()) > 10 and '.' in heading_text
+            if is_relevant_heading and not is_likely_paragraph:
+                 is_already_added=False
+                 if ingredients:
+                     clean_heading = heading_text.lower().rstrip(':').strip()
+                     clean_last_item = ingredients[-1].lower().rstrip(':').strip()
+                     if clean_heading == clean_last_item: is_already_added = True
+                 if not is_already_added:
+                     heading_id=str(heading)
+                     if heading_id not in processed_elements:
+                         ingredients.append(heading_text)
+                         processed_elements.add(heading_id)
+            list_element=heading.find_next_sibling(['ul','ol']);
+            if list_element and len(list_element.find_all('li')) < 50:
+                 if list_element not in list_containers: list_containers.append(list_element)
+            list_element_inside=heading.find_next(['ul','ol']);
+            if list_element_inside and len(list_element_inside.find_all('li')) < 50:
+                 if list_element_inside not in list_containers: list_containers.append(list_element_inside)
+        processed_lists=set(); unique_list_containers=[]
+        for lst in list_containers:
+            list_id=str(lst)
+            if list_id not in processed_lists:
+                unique_list_containers.append(lst)
+                processed_lists.add(list_id)
+
+        if unique_list_containers:
+             print(f"BS Scraper - Processing {len(unique_list_containers)} unique lists.")
+             for lst in unique_list_containers:
+                 possible_items=lst.find_all('li')
+                 for item in possible_items:
+                     item_id=str(item)
+                     if item_id not in processed_elements:
+                        text_parts=[part.strip() for part in item.stripped_strings]; text=' '.join(filter(None, text_parts)); has_number=any(char.isdigit() for char in text); is_reasonable_length=0<len(text.split())<25; is_not_just_link=not item.find('a') or len(item.find_all('a'))<len(text.split())/2; looks_like_junk=any(jp in text.lower() for jp in["related posts","you may also like","leave a reply","share this recipe","email recipe"])or text.lower().strip()=='ingredients'
+                        if text and is_reasonable_length and is_not_just_link and not looks_like_junk: ingredients.append(text); processed_elements.add(item_id)
+                        elif text and has_number and len(text.split())<25 and not looks_like_junk: ingredients.append(text); processed_elements.add(item_id)
+
+        # --- BS Cleaning Stage ---
+        if not ingredients: print("BS Scraper - No potential ingredients found."); return None
+        print(f"BS Scraper - Found {len(ingredients)} raw lines before cleaning.")
+        junk_phrases_exact=["scale","usm","units","ingredients"]; junk_phrases_contain=["cook mode","prevent your screen","nutrition information","optional","equipment","instructions","recipe notes","serving size","calories","related posts","jump to recipe","print recipe","pin recipe","advertisement","share this","you may also like","leave a reply","reader interactions","expert tips","variations","storage","make ahead","about","contact","partner with us","privacy policy","terms of service","careers","media kit","advertising","subscribe","newsletter","all rights reserved","back to top","more recipes","shop","similar recipes","faq","frequently asked questions","sponsored","disclosure","affiliate links","this post may contain","skip to content","skip to main content","search","log in","register","about at media","image","photo","video","recipe originally published","sign up","follow us","get the book","free trial"]; junk_patterns_regex=[r'^\d+/\d+x\d+x\d+x$',r'^\d+x$',r'click here',r'print recipe',r'pin recipe',r'jump to recipe',r'advertisement',r'^\s*▢\s*',r'^\d+\s+comments?$',r'^\d+\s+minutes?$',r'(?i)Course:',r'(?i)Cuisine:',r'(?i)Keyword:',r'(?i)Prep time:',r'(?i)Cook time:',r'(?i)Total time:',r'(?i)Servings:',r'^\©?\s*\d{4}',r'(?i)facebook',r'(?i)instagram',r'(?i)twitter',r'(?i)pinterest',r'(?i)youtube',r'(?i)tiktok',r'(?i)read more',r'^\s*posted on',r'^\s*updated on',r'^\s*by\s+[A-Za-z\s.-]+',r'^\s*(previous|next)\s+(post|recipe)',r'\.{3,}','★|☆',r'^(watch|view)\s+video',r'(?i)link in bio',r'(?i)featured in']
+        cleaned_ingredients=[];
+        for item in ingredients:
+            original_item_stripped=item.strip(); temp_item_lower=original_item_stripped.lower(); is_junk=False; word_count=len(original_item_stripped.split())
+            if word_count > 35: is_junk=True
+            # *** CORRECTED Syntax HERE ***
+            if not is_junk and word_count == 1 and not any(char.isdigit() for char in original_item_stripped):
+                allowed_single_words = {'salt','pepper','oil','sugar','flour','water','milk','eggs','butter','onion','garlic'}
+                if temp_item_lower not in allowed_single_words:
+                    is_junk = True
+            # *** END Correction ***
+            if not is_junk and temp_item_lower in junk_phrases_exact: is_junk=True
+            if not is_junk:
+                for junk in junk_phrases_contain:
+                    if junk in temp_item_lower:
+                         if word_count>4 or len(junk.split())<=2 : is_junk=True; break
+            if not is_junk:
+                for pattern in junk_patterns_regex:
+                    if re.search(pattern, original_item_stripped, re.I): is_junk=True; break
+            if not is_junk and original_item_stripped:
+                 if item.isupper() and 1<word_count<6: cleaned_ingredients.append(original_item_stripped.title())
+                 else: cleaned_ingredients.append(original_item_stripped)
+
+        seen=set(); final_ingredients=[]
+        for item in cleaned_ingredients:
+            item_lower=item.lower().strip().rstrip(':').strip()
+            if item_lower and item_lower not in seen:
+                final_ingredients.append(item)
+                seen.add(item_lower)
+
+        if not final_ingredients: print("BS Scraper - Cleaning removed all items."); return None
+        print(f"BS Scraper - Returning {len(final_ingredients)} cleaned ingredients.")
+        return "\n".join(final_ingredients)
+
+    # --- BS Error Handling (Corrected Structure) ---
+    except RequestException as e:
+        print(f"BS Scraper - Request failed for URL {url}: {e}")
+        status_code = None
+        if hasattr(e, 'response') and e.response is not None:
+            status_code = e.response.status_code
+
+        if isinstance(e, HTTPError) and status_code == 403: msg = f"Access Forbidden (403). The website blocked the request."
+        elif isinstance(e, HTTPError): msg = f"Website error (Status {status_code}). Page might be missing or restricted."
+        elif isinstance(e, ConnectionError): msg = f"Could not connect to the website at {url}."
+        elif isinstance(e, Timeout): msg = f"The request to {url} timed out."
+        else: msg = f"Could not fetch URL for scraping ({status_code if status_code else 'Network Error'})."
+        raise ValueError(msg)
+
+    except Exception as e:
+        print(f"BS Scraper - Error during BeautifulSoup processing for URL {url}: {e}")
+        traceback.print_exc()
+        raise ValueError(f"An error occurred while parsing the recipe content (fallback method).")
+
+
+# --- Main API Endpoint (v3.10.2 - Refined Logic, Corrected Syntax) ---
+@app.route('/api/rip-recipe', methods=['POST'])
+def rip_recipe_api():
+    if not request.is_json: return jsonify({"error": "Request format must be JSON"}), 415
+    data = request.get_json()
+    original_url = data.get('url')
+    if not original_url: return jsonify({"error": "Missing required 'url' field in JSON request"}), 400
+    if not re.match(r'^https?://', original_url): return jsonify({"error": "Invalid URL provided. Please include http:// or https://"}), 400
+
+    target_url = original_url # Default target
+    headers = { # Standard headers
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
         'Accept-Language': 'en-US,en;q=0.9', 'Accept-Encoding': 'gzip, deflate, br', 'DNT': '1',
@@ -115,41 +440,20 @@ def rip_recipe_api():
 
     try:
         print(f"Received URL for processing: {original_url}")
+        is_pinterest = 'pinterest.com' in original_url.lower() and '/pin/' in original_url.lower()
         ingredients_text = None
 
         # --- Determine target URL ---
         if is_pinterest:
-            if not PINTEREST_API_ENABLED:
-                 raise ValueError("Pinterest API is not configured (missing Access Token). Cannot process Pinterest links.")
-
-            print("Pinterest URL detected. Attempting to use Pinterest API...")
-            pin_id = extract_pin_id(original_url)
-            if not pin_id:
-                 raise ValueError("Could not extract Pin ID from the provided Pinterest URL.")
-
-            pin_data = get_pin_data_from_api(pin_id) # Call API helper
-
-            if pin_data and pin_data.get('link'): # Check if link exists in API response
-                 link = pin_data.get('link')
-                 # Clean the link (sometimes has tracking)
-                 parsed_link = urlparse(link)
-                 cleaned_link = f"{parsed_link.scheme}://{parsed_link.netloc}{parsed_link.path}"
-                 if parsed_link.query: # Keep query params if they exist
-                     cleaned_link += f"?{parsed_link.query}"
-
-                 # Ensure it's not linking back to Pinterest
-                 if cleaned_link and 'pinterest.com' not in urlparse(cleaned_link).netloc:
-                      target_url = cleaned_link # Use the link from the API!
-                      print(f"Found source URL via Pinterest API: {target_url}")
-                 else:
-                      print(f"API returned a link, but it points back to Pinterest or is invalid: {link}")
-                      raise ValueError("The link found on Pinterest points back to Pinterest itself. Please provide the direct recipe URL.")
+            print("Pinterest URL detected. Attempting to find source URL...")
+            source_url = extract_source_url_from_pinterest(original_url, headers)
+            if source_url:
+                 target_url = source_url # Scrape the external link if found
+                 print(f"Found source URL, proceeding to scrape: {target_url}")
             else:
-                 # API didn't return a link field
-                 print("Pinterest API did not provide a source link for this Pin.")
-                 # Optionally try to get ingredients from description field if needed?
-                 # desc_ingredients = pin_data.get('description') # Handle this text if desired
-                 raise ValueError("Could not find a source recipe link via the Pinterest API for this Pin.")
+                 # *** If no external link FOUND -> ERROR ***
+                 print("Could not find source URL on Pinterest page. Aborting.")
+                 raise ValueError("Could not find the source recipe link on the Pinterest page. Please provide the direct recipe URL.")
         else:
             target_url = original_url # Not Pinterest, scrape directly
 
@@ -157,14 +461,16 @@ def rip_recipe_api():
 
         # --- Scrape the final target URL ---
         print(f"Attempting scrape on final target: {target_url}")
+        # Try library first
         ingredients_text = scrape_ingredients_with_library(target_url, headers)
 
+        # Fallback to BeautifulSoup if library fails (but NOT for Pinterest URLs)
         if ingredients_text is None:
             print("Library scraping failed or unsupported, trying BeautifulSoup fallback...")
             # Check again: don't run BS fallback on a Pinterest URL
             if 'pinterest.com' in target_url.lower() and '/pin/' in target_url.lower():
                  print("BS fallback skipped for Pinterest URL.")
-                 # Should not happen based on logic above, but safety check
+                 # Keep ingredients_text as None
             else:
                  ingredients_text = scrape_ingredients_with_bs(target_url, headers)
 
@@ -181,7 +487,7 @@ def rip_recipe_api():
             error_msg = f"Could not automatically find ingredients for the target URL: {target_info_for_frontend}. The site structure may be unsupported or blocked."
             return jsonify({"error": error_msg}), 400
 
-    except ValueError as e: # Catch user-friendly errors (including API/Pinterest issues)
+    except ValueError as e: # Catch user-friendly errors
         print(f"--- Handled Value Error: {e} ---")
         return jsonify({"error": str(e)}), 400
     except Exception as e: # Catch any other unexpected errors
@@ -192,7 +498,6 @@ def rip_recipe_api():
 
 # --- Run the App ---
 if __name__ == '__main__':
-    # (Local dev server block remains the same as v3.10.1)
     print("-------------------------------------------------------")
     print("Starting Flask DEVELOPMENT server (for local testing)...")
     print("DO NOT use this server for production deployment.")
