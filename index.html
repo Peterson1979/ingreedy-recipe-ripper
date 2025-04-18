@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>INGREEDY - Recipe Ingredient Ripper</title>
+    <link rel="stylesheet" href="style.css"> <!-- Ensure this points to your CSS file -->
+    <script defer src="script.js"></script> <!-- Ensure this points to your JS file -->
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <h1><img src="icon.svg" alt="" class="icon"> INGREEDY</h1>
+        <h2 class="subtitle">Recipe Ingredient Ripper</h2>
+        <p class="tagline">Note: Data extraction may not work for all sites or may be blocked.</p>
+
+        <!-- Input Section -->
+        <div class="input-section">
+            <label for="urlInput">Enter Recipe URL:</label>
+            <input type="url" id="urlInput" placeholder="e.g., https://www.yourfavoriterecipeblog.com/recipe-page">
+            <button id="ripButton" type="button">Rip Ingredients</button>
+        </div>
+
+        <!-- Loading Indicator -->
+        <div id="loadingIndicator" class="hidden">
+            <p>Processing... Please wait.</p>
+            <div class="spinner"></div>
+        </div>
+
+        <!-- Status Message Boxes -->
+        <div id="errorSection" class="hidden info-box error">
+             <strong id="errorType">Error:</strong> <span id="errorMessage"></span>
+        </div>
+        <div id="infoSection" class="info-box hidden">
+             <p id="infoMessage"></p>
+        </div>
+
+        <!-- Results Area (Initially Hidden) -->
+        <div id="resultsSection" class="hidden">
+            <!-- Extracted Ingredients Display -->
+            <h2>Extracted Ingredients</h2>
+            <textarea id="ingredientsTextarea" rows="8" placeholder="Extracted ingredients will appear here..." readonly></textarea>
+            <div id="sourceInfo" class="hidden">
+                <small>Source: <a href="#" id="sourceUrlLink" target="_blank" rel="noopener noreferrer"></a></small>
+            </div>
+            <button id="copyToShoppingListButton" type="button" title="Copy extracted list below to start editing" disabled>
+                <img src="copy-icon.svg" alt="Copy"> Extract Ingredients First
+            </button>
+
+            <!-- Editable Shopping List -->
+            <div class="shopping-list-section">
+                 <div class="shopping-list-header">
+                    <h2>Editable Shopping List</h2>
+                    <span id="saveStatus" class="save-status hidden"></span>
+                </div>
+                <ul id="shoppingList" class="editable-list" aria-live="polite">
+                    <!-- Placeholder is managed by JS -->
+                    <li class="placeholder">Your shopping list will appear here.</li>
+                </ul>
+
+                <!-- Action Buttons -->
+                <div class="actions">
+                    <button id="copyButton" type="button" title="Copy shopping list to clipboard" disabled><img src="copy-icon.svg" alt="Copy"> Copy List</button>
+                    <button id="saveTextButton" type="button" title="Save shopping list as a .txt file" disabled><img src="save-text-icon.svg" alt="Save Text"> Save as Text</button>
+                    <button id="saveImageButton" type="button" title="Save shopping list as a .png image" disabled><img src="save-image-icon.svg" alt="Save Image"> Save as Image</button>
+                    <button id="shareGenericButton" type="button" title="Share shopping list" disabled><img src="share-icon.svg" alt="Share"> Share</button>
+                    <div class="share-buttons" aria-disabled="true">
+                        <!-- Optional specific share buttons -->
+                        <a href="#" id="shareTwitter" title="Share on Twitter" target="_blank"><img src="twitter-icon.svg" alt="Twitter"></a>
+                        <a href="#" id="shareFacebook" title="Share on Facebook" target="_blank"><img src="facebook-icon.svg" alt="Facebook"></a>
+                        <a href="#" id="shareEmail" title="Share via Email"><img src="email-icon.svg" alt="Email"></a>
+                        <a href="#" id="sharePinterest" title="Share on Pinterest" target="_blank"><img src="pinterest-icon.svg" alt="Pinterest"></a>
+                    </div>
+                    <div class="list-management-buttons">
+                         <button id="clearCheckedButton" type="button" title="Remove checked items from the list" disabled><img src="clear-checked-icon.svg" alt="Clear"> Clear Checked</button>
+                         <button id="clearAllButton" type="button" title="Remove ALL items from the list" disabled><img src="clear-all-icon.svg" alt="Clear All"> Clear All</button>
+                         <button id="addItemButton" type="button" title="Add a new item to the shopping list"><img src="add-icon.svg" alt="Add"> Add Item</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <!-- Canvas for image generation -->
+        <canvas id="imageCanvas" style="display: none;"></canvas>
+    </div>
+
+    <!-- Footer -->
+    <footer>
+        <p class="disclaimer">
+            Disclaimer: This tool attempts to extract recipe ingredients for personal convenience. Always verify accuracy. Respect website copyrights and terms of service. Data extraction may not work for all websites or may be blocked. Shopping list is saved in your browser's local storage.
+        </p>
+        <p>INGREEDY v1.9.4</p> <!-- Version Marker -->
+    </footer>
+
+</body>
+</html>
